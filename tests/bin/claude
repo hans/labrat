@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Mock claude CLI for integration tests.
+# Mimics `claude -p --system-prompt <prompt> <context>` by returning a canned interpretation.
+
+echo "**Analysis Summary**
+
+The Random Forest classifier achieved high accuracy on the Iris dataset. All three species were classified with >90% precision. Setosa was perfectly separated; minor confusion between versicolor and virginica.
+
+**Next steps:** Try SVM or gradient boosting for comparison."

@@ -31,11 +31,11 @@ class TestLrIntegration:
     """End-to-end integration tests for lr."""
 
     def test_successful_pipeline_with_interpret(self, lr_env):
-        """Full happy path: snakemake succeeds, results SCP'd, Linear updated, interpretation posted."""
+        """Full happy path: lr runs pipeline, writes .lr-interpret, interpret script posts to Linear."""
         env = lr_env["env"]
         issue_id = create_test_issue(env)
-        anthropic_requests_before = len(lr_env["anthropic_requests"])
 
+        # Step 1: Run lr with --interpret
         result = subprocess.run(
             [
                 LR,
@@ -79,12 +79,36 @@ class TestLrIntegration:
         # Results copied to guest mount
         assert list(lr_env["guest_mount"].rglob("metrics.json")), "metrics.json not in guest mount"
 
-        # Anthropic mock was called (interpretation)
-        assert len(lr_env["anthropic_requests"]) > anthropic_requests_before, (
-            "Anthropic API was not called for interpretation"
+        # .lr-interpret request was written
+        interpret_files = list(lr_env["guest_mount"].rglob(".lr-interpret"))
+        assert interpret_files, (
+            ".lr-interpret not found in guest mount — interpretation handoff failed"
+        )
+        interpret_request = json.loads(interpret_files[0].read_text())
+        assert interpret_request["issue_id"] == issue_id
+        assert interpret_request["exit_code"] == 0
+
+        # Step 2: Run interpret script (simulates /interpret in Claude Code)
+        # Uses mock claude from tests/bin/ on PATH
+        interpret_result = subprocess.run(
+            [lr_env["interpret"], issue_id],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
         )
 
-        # Verify Linear issue was updated by querying it
+        assert interpret_result.returncode == 0, (
+            f"interpret failed (exit {interpret_result.returncode}):\n"
+            f"STDOUT:\n{interpret_result.stdout}\n"
+            f"STDERR:\n{interpret_result.stderr}"
+        )
+
+        # .lr-interpret should be consumed
+        interpret_files = list(lr_env["guest_mount"].rglob(".lr-interpret"))
+        assert not interpret_files, ".lr-interpret still present after interpret ran"
+
+        # Issue should be in "Ready for Review" (set by interpret)
         status_result = subprocess.run(
             [LR_UPDATE, "list", "--status", "Ready for Review"],
             capture_output=True,
@@ -97,10 +121,9 @@ class TestLrIntegration:
         )
 
     def test_successful_pipeline_no_interpret(self, lr_env):
-        """Without --interpret: results SCP'd, Linear updated to Done, no Anthropic call."""
+        """Without --interpret: results SCP'd, Linear updated to Done, no interpretation."""
         env = lr_env["env"]
         issue_id = create_test_issue(env)
-        anthropic_requests_before = len(lr_env["anthropic_requests"])
 
         result = subprocess.run(
             [
@@ -123,12 +146,7 @@ class TestLrIntegration:
         result_dirs = list(lr_env["results_dir"].glob(f"{issue_id}/*"))
         assert len(result_dirs) >= 1
 
-        # No Anthropic call
-        assert len(lr_env["anthropic_requests"]) == anthropic_requests_before, (
-            "Anthropic API should not be called without --interpret"
-        )
-
-        # Issue should be Done
+        # Issue should be Done (not Ready for Review)
         status_result = subprocess.run(
             [LR_UPDATE, "list", "--status", "Done"],
             capture_output=True,
@@ -143,7 +161,6 @@ class TestLrIntegration:
         """Failing snakemake: Linear gets failure update, no interpretation."""
         env = lr_env["env"]
         issue_id = create_test_issue(env)
-        anthropic_requests_before = len(lr_env["anthropic_requests"])
 
         result = subprocess.run(
             [
@@ -163,11 +180,6 @@ class TestLrIntegration:
         assert result.returncode == 0, (
             f"lr should exit 0 even on pipeline failure:\n"
             f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        )
-
-        # No Anthropic call (interpretation skipped on failure)
-        assert len(lr_env["anthropic_requests"]) == anthropic_requests_before, (
-            "Anthropic API should not be called when pipeline fails"
         )
 
         # Issue should have a failure comment — verify by reading issue comments

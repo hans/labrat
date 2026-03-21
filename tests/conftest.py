@@ -1,9 +1,6 @@
-import json
 import os
 import subprocess
 import time
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 import docker
@@ -11,63 +8,9 @@ import pytest
 
 TESTS_DIR = Path(__file__).parent
 DOCKER_DIR = TESTS_DIR / "docker"
+MOCK_BIN_DIR = TESTS_DIR / "bin"
 PROJECT_ROOT = TESTS_DIR.parent
-
-
-class AnthropicMockHandler(BaseHTTPRequestHandler):
-    """Mock server for the Anthropic API."""
-
-    requests_log: list = []
-
-    def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        data = json.loads(body)
-
-        self.requests_log.append({"path": self.path, "body": data})
-
-        response = {
-            "id": "msg_test",
-            "type": "message",
-            "role": "assistant",
-            "model": "claude-sonnet-4-20250514",
-            "stop_reason": "end_turn",
-            "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        "**Analysis Summary**\n\n"
-                        "The Random Forest classifier achieved high accuracy on the Iris dataset. "
-                        "All three species were classified with >90% precision. "
-                        "Setosa was perfectly separated; minor confusion between versicolor and virginica.\n\n"
-                        "**Next steps:** Try SVM or gradient boosting for comparison."
-                    ),
-                }
-            ],
-        }
-
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(response).encode())
-
-    def log_message(self, format, *args):
-        pass
-
-
-@pytest.fixture(scope="session")
-def anthropic_mock():
-    """Run a mock Anthropic API server."""
-    AnthropicMockHandler.requests_log = []
-    server = HTTPServer(("127.0.0.1", 0), AnthropicMockHandler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield {
-        "url": f"http://127.0.0.1:{port}",
-        "requests": AnthropicMockHandler.requests_log,
-    }
-    server.shutdown()
+INTERPRET = str(PROJECT_ROOT / "interpret")
 
 
 @pytest.fixture(scope="session")
@@ -163,7 +106,7 @@ def remote_container(ssh_keypair):
 
 
 @pytest.fixture()
-def lr_env(remote_container, anthropic_mock, tmp_path):
+def lr_env(remote_container, tmp_path):
     """Build the environment dict for running lr."""
     results_dir = tmp_path / "results"
     guest_mount = tmp_path / "guest"
@@ -206,6 +149,9 @@ def lr_env(remote_container, anthropic_mock, tmp_path):
         f'LINEAR_TEAM_ID="{env["LINEAR_TEAM_ID"]}"\n'
     )
 
+    # Put mock claude on PATH for interpret script
+    env["PATH"] = f"{MOCK_BIN_DIR}:{env.get('PATH', '')}"
+
     env.update(
         {
             "HOME": str(fake_home),
@@ -213,8 +159,7 @@ def lr_env(remote_container, anthropic_mock, tmp_path):
             "LR_SSH_OPTIONS": rc["ssh_options"],
             "LR_RESULTS_DIR": str(results_dir),
             "LR_GUEST_MOUNT": str(guest_mount),
-            "ANTHROPIC_API_KEY": "sk-ant-test-fake-key",
-            "ANTHROPIC_API_URL": anthropic_mock["url"],
+            "LR_RESULTS_MOUNT": str(guest_mount / "lr-results"),
         }
     )
 
@@ -223,21 +168,5 @@ def lr_env(remote_container, anthropic_mock, tmp_path):
         "results_dir": results_dir,
         "guest_mount": guest_mount,
         "remote_dir": rc["remote_dir"],
-        "anthropic_requests": anthropic_mock["requests"],
+        "interpret": INTERPRET,
     }
-
-
-def create_test_issue(env: dict, prefix: str = "lr-integration-test") -> str:
-    """Create a Linear issue for testing, return its identifier."""
-    timestamp = time.strftime("%Y%m%dT%H%M%S")
-    title = f"{prefix} {timestamp}"
-    result = subprocess.run(
-        [str(PROJECT_ROOT / "lr-update"), "new", title],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert result.returncode == 0, f"Failed to create issue: {result.stderr}"
-    # Output is like "Created JON-42"
-    identifier = result.stdout.strip().split()[-1]
-    return identifier
