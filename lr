@@ -28,7 +28,7 @@ LR_SSH_OPTIONS="${LR_SSH_OPTIONS:-}"
 LINEAR_API_KEY="${LINEAR_API_KEY:-}"
 LINEAR_TEAM_ID="${LINEAR_TEAM_ID:-}"
 LINEAR_API_URL="${LINEAR_API_URL:-https://api.linear.app/graphql}"
-ANTHROPIC_API_URL="${ANTHROPIC_API_URL:-https://api.anthropic.com}"
+LR_GUEST_CONTAINER="${LR_GUEST_CONTAINER:-}"
 
 # --- parse args ---
 
@@ -251,66 +251,35 @@ fi
 # --- Step 7 (optional): Agent interpretation ---
 
 if [[ "$INTERPRET" == true && $EXIT_CODE -eq 0 ]]; then
-  echo "Running agent interpretation..."
-
-  ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:?ERROR: ANTHROPIC_API_KEY required for --interpret}"
-
-  # Assemble context
-  CONTEXT="CONTEXT:
-- Issue: $ISSUE_ID
-- Command: $CMD_STR
-- Exit code: $EXIT_CODE
-- Duration: $DURATION_FMT
-- Last 30 lines of output log:
-$(tail -30 "$LOG_FILE" 2>/dev/null || echo "(no log)")
-- SCP'd files:
-$(ls -lhS "$LOCAL_DEST/" 2>/dev/null | tail -n +2 || echo "(none)")"
-
-  # Include small text file contents
-  for f in "$LOCAL_DEST"/*.csv "$LOCAL_DEST"/*.json "$LOCAL_DEST"/*.txt "$LOCAL_DEST"/*.tsv; do
-    if [[ -f "$f" ]]; then
-      fsize=$(wc -c < "$f")
-      if (( fsize < 50000 )); then
-        CONTEXT="$CONTEXT
-
-- Contents of $(basename "$f"):
-$(cat "$f")"
-      fi
-    fi
-  done 2>/dev/null
-
-  # Include custom prompt if available
-  if [[ -f "$LOCAL_DEST/.lr-agent-prompt" ]]; then
-    CONTEXT="$CONTEXT
-
-- Custom instructions (.lr-agent-prompt):
-$(cat "$LOCAL_DEST/.lr-agent-prompt")"
+  if [[ -z "$LR_GUEST_MOUNT" ]]; then
+    echo "ERROR: LR_GUEST_MOUNT required for --interpret" >&2
+    exit 1
   fi
 
-  # Call Anthropic API
-  ESCAPED_CONTEXT=$(printf '%s' "$CONTEXT" | jq -Rs .)
-  RESPONSE=$(curl -s "$ANTHROPIC_API_URL/v1/messages" \
-    -H "x-api-key: $ANTHROPIC_API_KEY" \
-    -H "content-type: application/json" \
-    -H "anthropic-version: 2023-06-01" \
-    -d "{
-      \"model\": \"claude-sonnet-4-20250514\",
-      \"max_tokens\": 1500,
-      \"system\": \"You are a research assistant interpreting neuroscience analysis results. Write a concise update for a Linear issue. Include: (1) what completed, (2) key quantitative results, (3) notable observations, (4) suggested next steps. Use markdown. Be specific, not vague.\",
-      \"messages\": [{\"role\": \"user\", \"content\": $ESCAPED_CONTEXT}]
-    }")
+  INTERPRET_DIR="$LR_GUEST_MOUNT/lr-results/$ISSUE_ID"
+  mkdir -p "$INTERPRET_DIR"
+  INTERPRET_FILE="$INTERPRET_DIR/.lr-interpret"
 
-  INTERPRETATION=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+  cat > "$INTERPRET_FILE" <<JSONEOF
+{
+  "issue_id": "$ISSUE_ID",
+  "timestamp": "$TIMESTAMP",
+  "command": $(printf '%s' "${REMOTE_CMD[*]}" | jq -Rs .),
+  "exit_code": $EXIT_CODE,
+  "duration": "$DURATION_FMT",
+  "results_dir": "$TIMESTAMP",
+  "log_tail": $(tail -30 "$LOG_FILE" 2>/dev/null | jq -Rs . || echo '""')
+}
+JSONEOF
 
-  if [[ -n "$INTERPRETATION" ]]; then
-    "$LR_UPDATE" comment "$ISSUE_ID" "**Agent Interpretation**
+  echo "Interpretation request written to $INTERPRET_FILE"
 
-$INTERPRETATION"
-    "$LR_UPDATE" status "$ISSUE_ID" "Ready for Review"
-    echo "Interpretation posted to $ISSUE_ID"
+  if [[ -n "$LR_GUEST_CONTAINER" ]]; then
+    echo "Triggering interpretation in guest container..."
+    docker exec "$LR_GUEST_CONTAINER" interpret "$ISSUE_ID" || \
+      echo "Warning: docker exec failed. Run 'interpret $ISSUE_ID' manually in Claude Code." >&2
   else
-    echo "Warning: Could not generate interpretation" >&2
-    echo "$RESPONSE" | jq . >&2
+    echo "Run 'interpret $ISSUE_ID' in Claude Code to generate interpretation."
   fi
 fi
 

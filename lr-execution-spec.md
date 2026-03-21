@@ -111,7 +111,7 @@ LR_RESULTS_DIR="$HOME/.lr/results"   # where SCP'd results land on host
 LR_GUEST_MOUNT="/path/to/shared"     # host path mounted into docker guest
 
 # Agent (for --interpret mode)
-ANTHROPIC_API_KEY=""                  # for calling Claude API directly
+LR_GUEST_CONTAINER=""                # docker container name for auto-trigger (optional)
 
 # Notifications
 LR_NTFY_TOPIC=""                     # optional, failures only
@@ -247,58 +247,45 @@ $(tail -20 $LOCAL_DEST/../run.log)"
 
 Also send ntfy on failure if configured.
 
-### Step 7 (optional): Agent interpretation
+### Step 7 (optional): Agent interpretation via Claude Code
 
 If `--interpret` flag was set:
 
-1. Assemble context for the agent:
-
-```
-CONTEXT:
-- Issue: JON-15 "Ganong population decoding" (project: Barakeet)
-- Command: snakemake -j4 --configfile config.yaml
-- Exit code: 0
-- Duration: 12m 34s
-- Last 30 lines of output log:
-  <log tail>
-- SCP'd files:
-  figures/ganong_pop.pdf (142KB)
-  figures/ganong_corr.pdf (98KB)
-  results/accuracy.csv (2KB)
-  results/population_stats.json (1KB)
-- Contents of results/accuracy.csv:
-  <file contents>
-- Contents of results/population_stats.json:
-  <file contents>
-- Custom instructions (.lr-agent-prompt):
-  <if exists>
-```
-
-2. Call Anthropic API:
+1. Write a `.lr-interpret` JSON request to the guest mount:
 
 ```bash
-curl -s https://api.anthropic.com/v1/messages \
-  -H "x-api-key: $ANTHROPIC_API_KEY" \
-  -H "content-type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{
-    "model": "claude-sonnet-4-20250514",
-    "max_tokens": 1500,
-    "system": "You are a research assistant interpreting neuroscience analysis results. Write a concise update for a Linear issue. Include: (1) what completed, (2) key quantitative results, (3) notable observations, (4) suggested next steps. Use markdown. Be specific, not vague.",
-    "messages": [{"role": "user", "content": "<assembled context>"}]
-  }'
+cat > "$LR_GUEST_MOUNT/lr-results/$ISSUE_ID/.lr-interpret" <<EOF
+{
+  "issue_id": "JON-15",
+  "timestamp": "20260321T152500",
+  "command": "snakemake -j4 --configfile config.yaml",
+  "exit_code": 0,
+  "duration": "12m 34s",
+  "results_dir": "20260321T152500",
+  "log_tail": "<last 30 lines>"
+}
+EOF
 ```
 
-3. Post the agent's response as a comment on the Linear issue.
+2. If `LR_GUEST_CONTAINER` is set, auto-trigger via docker exec:
 
-4. Set issue status to "Ready for Review".
+```bash
+docker exec "$LR_GUEST_CONTAINER" interpret JON-15
+```
 
-**Alternative to API call:** Instead of calling the Anthropic API directly,
-`lr` could write the context to the guest mount and signal Claude Code
-to interpret it. This would let Claude Code use its full tool suite
-(e.g., opening plots, running follow-up analysis). Implementation TBD —
-the API call is simpler for v1, Claude Code integration is more powerful
-for v2.
+Otherwise, print a message for the user to run `interpret JON-15` manually
+in Claude Code.
+
+3. The `interpret` script (running in the guest) reads the request,
+   assembles context (metadata, file listings, small file contents,
+   `.lr-agent-prompt`), invokes `claude -p` for interpretation, then
+   posts the result as a Linear comment via `lr-update` and sets the
+   issue status to "Ready for Review".
+
+This approach lets Claude Code use its full tool suite (reading images,
+running follow-up analysis) rather than being limited to a single
+stateless API call. It also removes the need for `ANTHROPIC_API_KEY`
+in `~/.lr/config`.
 
 ---
 
@@ -462,12 +449,13 @@ onerror:
 
 ## Script summary
 
-Two scripts total:
+Three scripts total:
 
 | Script | Where | What |
 |--------|-------|------|
-| `lr` | local host only | Wraps snakemake via SSH. SCPs results. Optionally invokes agent. Updates Linear. |
+| `lr` | local host only | Wraps snakemake via SSH. SCPs results. Writes interpret request. Updates Linear. |
 | `lr-update` | everywhere (host, guest, remote) | Standalone Linear API wrapper. Creates/updates issues and comments. |
+| `interpret` | local guest only | Reads interpret request, invokes `claude -p`, posts interpretation to Linear. |
 
-Both are bash. Both source `~/.lr/config`. Total: probably ~300 lines
-for lr, ~150 lines for lr-update.
+All are bash. All source `~/.lr/config`. Total: ~280 lines for lr, ~150
+lines for lr-update, ~120 lines for interpret.
