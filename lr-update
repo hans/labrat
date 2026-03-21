@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# lr-update — standalone Linear API wrapper
+# Usage: lr-update <command> <args...>
+# Commands: done, fail, comment, status, new, new-project, list, list-projects
+
+# Handle help before config so it works without credentials
+if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then
+  cat <<'HELPEOF'
+Usage: lr-update <command> [args...]
+
+Commands:
+  done <issue> [message]              Mark issue done with optional comment
+  fail <issue> [message]              Mark issue failed with optional comment
+  comment <issue> <message>           Post a comment on an issue
+  status <issue> <status-name>        Change issue status
+  new <title> [--project P] [--status S] [--description D]
+                                      Create a new issue
+  new-project <name> [--description D]
+                                      Create a new project
+  list [--project P] [--status S]     List issues
+  list-projects                       List projects
+
+Examples:
+  lr-update done JON-15 "Pipeline completed"
+  lr-update fail JON-15 "OOM at step 3"
+  lr-update comment JON-15 "Intermediate results look good"
+  lr-update status JON-15 "Computing"
+  lr-update new "New analysis" --project Barakeet --status Computing
+  lr-update list --project Barakeet --status "In Progress"
+HELPEOF
+  exit 0
+fi
+
+CONFIG_FILE="${HOME}/.lr/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+LINEAR_API_KEY="${LINEAR_API_KEY:?ERROR: LINEAR_API_KEY not set. Configure in ~/.lr/config}"
+LINEAR_TEAM_ID="${LINEAR_TEAM_ID:?ERROR: LINEAR_TEAM_ID not set. Configure in ~/.lr/config}"
+
+# --- helpers ---
+
+LINEAR_API_URL="${LINEAR_API_URL:-https://api.linear.app/graphql}"
+
+gql() {
+  local query="$1"
+  curl -s -X POST "$LINEAR_API_URL" \
+    -H "Authorization: ${LINEAR_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"query\": $(printf '%s' "$query" | jq -Rs .)}"
+}
+
+get_issue_uuid() {
+  local identifier="$1"
+  local result
+  result=$(gql "{ issueVcsBranchSearch(branchName: \"$identifier\") { id } }")
+  local uuid
+  uuid=$(echo "$result" | jq -r '.data.issueVcsBranchSearch.id // empty')
+  if [[ -n "$uuid" ]]; then
+    echo "$uuid"
+    return
+  fi
+  # Try searching by identifier
+  result=$(gql "{ issues(filter: { number: { eq: ${identifier##*-} }, team: { key: { eq: \"${identifier%%-*}\" } } }) { nodes { id } } }")
+  uuid=$(echo "$result" | jq -r '.data.issues.nodes[0].id // empty')
+  if [[ -n "$uuid" ]]; then
+    echo "$uuid"
+    return
+  fi
+  echo "ERROR: Could not resolve issue '$identifier'" >&2
+  return 1
+}
+
+get_state_id() {
+  local state_name="$1"
+  local result
+  result=$(gql "{ workflowStates(filter: { team: { id: { eq: \"$LINEAR_TEAM_ID\" } }, name: { eqIgnoreCase: \"$state_name\" } }) { nodes { id name } } }")
+  local state_id
+  state_id=$(echo "$result" | jq -r '.data.workflowStates.nodes[0].id // empty')
+  if [[ -n "$state_id" ]]; then
+    echo "$state_id"
+    return
+  fi
+  echo "ERROR: Could not find state '$state_name' for team" >&2
+  return 1
+}
+
+get_project_id() {
+  local project_name="$1"
+  local result
+  result=$(gql "{ projects(filter: { name: { eqIgnoreCase: \"$project_name\" } }) { nodes { id name } } }")
+  local project_id
+  project_id=$(echo "$result" | jq -r '.data.projects.nodes[0].id // empty')
+  if [[ -n "$project_id" ]]; then
+    echo "$project_id"
+    return
+  fi
+  echo "ERROR: Could not find project '$project_name'" >&2
+  return 1
+}
+
+post_comment() {
+  local issue_uuid="$1"
+  local body="$2"
+  local escaped_body
+  escaped_body=$(printf '%s' "$body" | jq -Rs .)
+  gql "mutation { commentCreate(input: { issueId: \"$issue_uuid\", body: $escaped_body }) { success } }" > /dev/null
+}
+
+set_issue_state() {
+  local issue_uuid="$1"
+  local state_id="$2"
+  gql "mutation { issueUpdate(id: \"$issue_uuid\", input: { stateId: \"$state_id\" }) { success } }" > /dev/null
+}
+
+# --- commands ---
+
+cmd_done() {
+  local identifier="$1"
+  local message="${2:-Pipeline completed successfully.}"
+  local uuid state_id
+  uuid=$(get_issue_uuid "$identifier")
+  state_id=$(get_state_id "Done")
+  post_comment "$uuid" "$message"
+  set_issue_state "$uuid" "$state_id"
+  echo "Updated $identifier → Done"
+}
+
+cmd_fail() {
+  local identifier="$1"
+  local message="${2:-Pipeline failed.}"
+  local uuid state_id
+  uuid=$(get_issue_uuid "$identifier")
+  state_id=$(get_state_id "Failed")
+  # If "Failed" state doesn't exist, try "In Progress" as fallback
+  if [[ -z "$state_id" ]]; then
+    state_id=$(get_state_id "In Progress")
+  fi
+  post_comment "$uuid" "**Pipeline failed**\n\n$message"
+  if [[ -n "$state_id" ]]; then
+    set_issue_state "$uuid" "$state_id"
+  fi
+  echo "Updated $identifier → Failed"
+
+  # ntfy notification if configured
+  if [[ -n "${LR_NTFY_TOPIC:-}" ]]; then
+    curl -s -d "lr: $identifier failed — $message" "ntfy.sh/${LR_NTFY_TOPIC}" > /dev/null || true
+  fi
+}
+
+cmd_comment() {
+  local identifier="$1"
+  local message="$2"
+  local uuid
+  uuid=$(get_issue_uuid "$identifier")
+  post_comment "$uuid" "$message"
+  echo "Commented on $identifier"
+}
+
+cmd_status() {
+  local identifier="$1"
+  local status_name="$2"
+  local uuid state_id
+  uuid=$(get_issue_uuid "$identifier")
+  state_id=$(get_state_id "$status_name")
+  set_issue_state "$uuid" "$state_id"
+  echo "Updated $identifier → $status_name"
+}
+
+cmd_new() {
+  local title="$1"
+  shift
+  local project_name="" status_name="" description=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project) project_name="$2"; shift 2 ;;
+      --status) status_name="$2"; shift 2 ;;
+      --description) description="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local escaped_title
+  escaped_title=$(printf '%s' "$title" | jq -Rs .)
+
+  local input="teamId: \"$LINEAR_TEAM_ID\", title: $escaped_title"
+
+  if [[ -n "$description" ]]; then
+    local escaped_desc
+    escaped_desc=$(printf '%s' "$description" | jq -Rs .)
+    input="$input, description: $escaped_desc"
+  fi
+
+  if [[ -n "$status_name" ]]; then
+    local state_id
+    state_id=$(get_state_id "$status_name")
+    input="$input, stateId: \"$state_id\""
+  fi
+
+  local project_input=""
+  if [[ -n "$project_name" ]]; then
+    local project_id
+    project_id=$(get_project_id "$project_name")
+    project_input="projectId: \"$project_id\","
+  fi
+
+  local result
+  result=$(gql "mutation { issueCreate(input: { $project_input $input }) { success issue { identifier } } }")
+  local new_id
+  new_id=$(echo "$result" | jq -r '.data.issueCreate.issue.identifier // empty')
+  if [[ -n "$new_id" ]]; then
+    echo "Created $new_id"
+  else
+    echo "ERROR: Failed to create issue" >&2
+    echo "$result" | jq . >&2
+    return 1
+  fi
+}
+
+cmd_new_project() {
+  local name="$1"
+  shift
+  local description=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --description) description="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local escaped_name
+  escaped_name=$(printf '%s' "$name" | jq -Rs .)
+  local input="name: $escaped_name"
+
+  if [[ -n "$description" ]]; then
+    local escaped_desc
+    escaped_desc=$(printf '%s' "$description" | jq -Rs .)
+    input="$input, description: $escaped_desc"
+  fi
+
+  # Link project to team
+  input="$input, teamIds: [\"$LINEAR_TEAM_ID\"]"
+
+  local result
+  result=$(gql "mutation { projectCreate(input: { $input }) { success project { name id } } }")
+  local project_name_out
+  project_name_out=$(echo "$result" | jq -r '.data.projectCreate.project.name // empty')
+  if [[ -n "$project_name_out" ]]; then
+    echo "Created project: $project_name_out"
+  else
+    echo "ERROR: Failed to create project" >&2
+    echo "$result" | jq . >&2
+    return 1
+  fi
+}
+
+cmd_list() {
+  local project_filter="" status_filter=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project) project_filter="$2"; shift 2 ;;
+      --status) status_filter="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local filter="team: { id: { eq: \"$LINEAR_TEAM_ID\" } }"
+
+  if [[ -n "$project_filter" ]]; then
+    local project_id
+    project_id=$(get_project_id "$project_filter")
+    filter="$filter, project: { id: { eq: \"$project_id\" } }"
+  fi
+
+  if [[ -n "$status_filter" ]]; then
+    filter="$filter, state: { name: { eqIgnoreCase: \"$status_filter\" } }"
+  fi
+
+  local result
+  result=$(gql "{ issues(filter: { $filter }, orderBy: updatedAt) { nodes { identifier title state { name } } } }")
+  echo "$result" | jq -r '.data.issues.nodes[] | "\(.identifier)  \(.title)  [\(.state.name)]"'
+}
+
+cmd_list_projects() {
+  local result
+  result=$(gql "{ projects(filter: { accessibleTeams: { id: { eq: \"$LINEAR_TEAM_ID\" } } }) { nodes { name description } } }")
+  echo "$result" | jq -r '.data.projects.nodes[] | "\(.name)\(if .description then "  — " + .description else "" end)"'
+}
+
+# --- main ---
+
+usage() {
+  cat <<'EOF'
+Usage: lr-update <command> [args...]
+
+Commands:
+  done <issue> [message]              Mark issue done with optional comment
+  fail <issue> [message]              Mark issue failed with optional comment
+  comment <issue> <message>           Post a comment on an issue
+  status <issue> <status-name>        Change issue status
+  new <title> [--project P] [--status S] [--description D]
+                                      Create a new issue
+  new-project <name> [--description D]
+                                      Create a new project
+  list [--project P] [--status S]     List issues
+  list-projects                       List projects
+
+Examples:
+  lr-update done JON-15 "Pipeline completed"
+  lr-update fail JON-15 "OOM at step 3"
+  lr-update comment JON-15 "Intermediate results look good"
+  lr-update status JON-15 "Computing"
+  lr-update new "New analysis" --project Barakeet --status Computing
+  lr-update list --project Barakeet --status "In Progress"
+EOF
+}
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  done)    cmd_done "$@" ;;
+  fail)    cmd_fail "$@" ;;
+  comment) cmd_comment "$@" ;;
+  status)  cmd_status "$@" ;;
+  new)     cmd_new "$@" ;;
+  new-project) cmd_new_project "$@" ;;
+  list)    cmd_list "$@" ;;
+  list-projects) cmd_list_projects "$@" ;;
+  help|--help|-h) usage ;;
+  *)
+    echo "Unknown command: $COMMAND" >&2
+    usage
+    exit 1
+    ;;
+esac

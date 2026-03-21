@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# lr — Linear-integrated snakemake executor
+# Runs snakemake on a remote server via SSH, SCPs results back,
+# updates Linear issues, and optionally invokes Claude for interpretation.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+CONFIG_FILE="${HOME}/.lr/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+# Find lr-update (same directory as lr, or on PATH)
+LR_UPDATE="${SCRIPT_DIR}/lr-update"
+if [[ ! -x "$LR_UPDATE" ]]; then
+  LR_UPDATE="lr-update"
+fi
+
+# --- defaults ---
+
+LR_REMOTE_HOST="${LR_REMOTE_HOST:?ERROR: LR_REMOTE_HOST not set. Configure in ~/.lr/config}"
+LR_RESULTS_DIR="${LR_RESULTS_DIR:-$HOME/.lr/results}"
+LR_GUEST_MOUNT="${LR_GUEST_MOUNT:-}"
+LR_SSH_OPTIONS="${LR_SSH_OPTIONS:-}"
+LINEAR_API_KEY="${LINEAR_API_KEY:-}"
+LINEAR_TEAM_ID="${LINEAR_TEAM_ID:-}"
+LINEAR_API_URL="${LINEAR_API_URL:-https://api.linear.app/graphql}"
+ANTHROPIC_API_URL="${ANTHROPIC_API_URL:-https://api.anthropic.com}"
+
+# --- parse args ---
+
+ISSUE_ID=""
+REMOTE_DIR=""
+INTERPRET=false
+PROJECT=""
+REMOTE_CMD=()
+
+usage() {
+  cat <<'EOF'
+Usage: lr [options] <command...>
+
+Options:
+  --issue ID          Linear issue identifier (e.g. JON-15)
+  --remote-dir DIR    Working directory on remote server
+  --project NAME      Linear project name (for interactive selection / new issues)
+  --interpret         Run Claude interpretation on results
+  -h, --help          Show this help
+
+Examples:
+  lr --issue JON-15 snakemake -j4 --configfile config.yaml
+  lr --remote-dir /data/barakeet/ganong snakemake -j4
+  lr --interpret snakemake -j4
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --issue) ISSUE_ID="$2"; shift 2 ;;
+    --remote-dir) REMOTE_DIR="$2"; shift 2 ;;
+    --project) PROJECT="$2"; shift 2 ;;
+    --interpret) INTERPRET=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; REMOTE_CMD+=("$@"); break ;;
+    -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    *) REMOTE_CMD+=("$@"); break ;;
+  esac
+done
+
+if [[ ${#REMOTE_CMD[@]} -eq 0 ]]; then
+  echo "ERROR: No command specified" >&2
+  usage
+  exit 1
+fi
+
+# --- Step 1: Resolve issue ---
+
+resolve_issue() {
+  # 1. Explicit --issue flag
+  if [[ -n "$ISSUE_ID" ]]; then
+    return
+  fi
+
+  # 2. Environment variable
+  if [[ -n "${LINEAR_ISSUE:-}" ]]; then
+    ISSUE_ID="$LINEAR_ISSUE"
+    return
+  fi
+
+  # 3. Interactive selection
+  if [[ -z "$LINEAR_API_KEY" || -z "$LINEAR_TEAM_ID" ]]; then
+    echo "ERROR: No issue specified and LINEAR_API_KEY/LINEAR_TEAM_ID not configured" >&2
+    exit 1
+  fi
+
+  echo "No issue specified. Fetching open issues..."
+
+  local filter="team: { id: { eq: \"$LINEAR_TEAM_ID\" } }, state: { type: { in: [\"started\", \"unstarted\", \"backlog\"] } }"
+
+  if [[ -n "$PROJECT" ]]; then
+    local project_id
+    project_id=$("$LR_UPDATE" list-projects 2>/dev/null | head -1) # just to validate
+    # Use lr-update's gql indirectly — or query directly
+    local proj_result
+    proj_result=$(curl -s -X POST "$LINEAR_API_URL" \
+      -H "Authorization: ${LINEAR_API_KEY}" \
+      -H "Content-Type: application/json" \
+      -d "{\"query\": \"{ projects(filter: { name: { eqIgnoreCase: \\\"$PROJECT\\\" } }) { nodes { id } } }\"}")
+    local pid
+    pid=$(echo "$proj_result" | jq -r '.data.projects.nodes[0].id // empty')
+    if [[ -n "$pid" ]]; then
+      filter="$filter, project: { id: { eq: \"$pid\" } }"
+    fi
+  fi
+
+  local result
+  result=$(curl -s -X POST "$LINEAR_API_URL" \
+    -H "Authorization: ${LINEAR_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"query\": \"{ issues(filter: { $filter }, orderBy: updatedAt, first: 20) { nodes { identifier title state { name } } } }\"}")
+
+  local count
+  count=$(echo "$result" | jq -r '.data.issues.nodes | length')
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "No open issues found."
+    read -rp "Create a new issue? Enter title (or Ctrl-C to abort): " new_title
+    if [[ -n "$new_title" ]]; then
+      local new_args=("$new_title")
+      [[ -n "$PROJECT" ]] && new_args+=(--project "$PROJECT")
+      new_args+=(--status "Computing")
+      ISSUE_ID=$("$LR_UPDATE" new "${new_args[@]}" | grep -oE '[A-Z]+-[0-9]+')
+      echo "Created $ISSUE_ID"
+    else
+      exit 1
+    fi
+    return
+  fi
+
+  echo ""
+  echo "$result" | jq -r '.data.issues.nodes | to_entries[] | "  \(.key + 1). \(.value.identifier)  \(.value.title)  [\(.value.state.name)]"'
+  echo ""
+  read -rp "Select issue [1-$count] or 'n' to create new: " selection
+
+  if [[ "$selection" == "n" ]]; then
+    read -rp "Enter title for new issue: " new_title
+    local new_args=("$new_title")
+    [[ -n "$PROJECT" ]] && new_args+=(--project "$PROJECT")
+    new_args+=(--status "Computing")
+    ISSUE_ID=$("$LR_UPDATE" new "${new_args[@]}" | grep -oE '[A-Z]+-[0-9]+')
+    echo "Created $ISSUE_ID"
+  elif [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= count )); then
+    ISSUE_ID=$(echo "$result" | jq -r ".data.issues.nodes[$((selection - 1))].identifier")
+  else
+    echo "Invalid selection" >&2
+    exit 1
+  fi
+}
+
+resolve_issue
+echo "Using issue: $ISSUE_ID"
+
+# --- Step 2: Update Linear → Computing ---
+
+"$LR_UPDATE" status "$ISSUE_ID" "Computing" 2>/dev/null || echo "Warning: Could not set status to Computing"
+
+# --- Step 3: SSH + run command ---
+
+TIMESTAMP=$(date +%Y%m%dT%H%M%S)
+mkdir -p "$LR_RESULTS_DIR/$ISSUE_ID"
+LOG_FILE="$LR_RESULTS_DIR/$ISSUE_ID/run.log"
+
+SSH_CMD="${REMOTE_CMD[*]}"
+if [[ -n "$REMOTE_DIR" ]]; then
+  SSH_CMD="cd $(printf '%q' "$REMOTE_DIR") && $SSH_CMD"
+fi
+
+echo "Running on ${LR_REMOTE_HOST}: ${SSH_CMD}"
+START_TIME=$(date +%s)
+
+set +e
+ssh ${LR_SSH_OPTIONS} "${LR_REMOTE_HOST}" "${SSH_CMD}" 2>&1 | tee "$LOG_FILE"
+EXIT_CODE=${PIPESTATUS[0]}
+set -e
+
+END_TIME=$(date +%s)
+DURATION=$(( END_TIME - START_TIME ))
+DURATION_FMT="$(( DURATION / 60 ))m $(( DURATION % 60 ))s"
+
+echo ""
+echo "Exit code: $EXIT_CODE (duration: $DURATION_FMT)"
+
+# --- Step 4: SCP results ---
+
+LOCAL_DEST="$LR_RESULTS_DIR/$ISSUE_ID/$TIMESTAMP"
+mkdir -p "$LOCAL_DEST"
+
+if [[ -n "$REMOTE_DIR" ]]; then
+  # Read .lr-results patterns from remote (or use defaults)
+  PATTERNS=$(ssh ${LR_SSH_OPTIONS} "$LR_REMOTE_HOST" "cat $(printf '%q' "$REMOTE_DIR")/.lr-results 2>/dev/null" 2>/dev/null || echo -e "figures/*\nresults/*")
+
+  echo "SCPing results to $LOCAL_DEST ..."
+  while IFS= read -r pattern; do
+    [[ -z "$pattern" || "$pattern" =~ ^# ]] && continue
+    scp ${LR_SSH_OPTIONS} -r "$LR_REMOTE_HOST:$REMOTE_DIR/$pattern" "$LOCAL_DEST/" 2>/dev/null || true
+  done <<< "$PATTERNS"
+
+  # Grab .lr-agent-prompt if it exists
+  scp ${LR_SSH_OPTIONS} "$LR_REMOTE_HOST:$REMOTE_DIR/.lr-agent-prompt" "$LOCAL_DEST/" 2>/dev/null || true
+
+  echo "Results saved to $LOCAL_DEST"
+fi
+
+# --- Step 5: Copy to guest mount ---
+
+if [[ -n "$LR_GUEST_MOUNT" ]]; then
+  mkdir -p "$LR_GUEST_MOUNT/lr-results/$ISSUE_ID/"
+  cp -r "$LOCAL_DEST" "$LR_GUEST_MOUNT/lr-results/$ISSUE_ID/"
+  echo "Results copied to guest mount"
+fi
+
+# --- Step 6: Update Linear ---
+
+CMD_STR="${REMOTE_CMD[*]}"
+LOG_TAIL=$(tail -20 "$LOG_FILE" 2>/dev/null || echo "(no log)")
+
+if [[ $EXIT_CODE -eq 0 ]]; then
+  "$LR_UPDATE" done "$ISSUE_ID" "Snakemake pipeline completed successfully.
+
+**Command:** \`$CMD_STR\`
+**Duration:** $DURATION_FMT
+**Results:** $LOCAL_DEST
+
+\`\`\`
+$LOG_TAIL
+\`\`\`"
+else
+  "$LR_UPDATE" fail "$ISSUE_ID" "Snakemake pipeline failed (exit code $EXIT_CODE).
+
+**Command:** \`$CMD_STR\`
+**Duration:** $DURATION_FMT
+
+**Last 20 lines of output:**
+\`\`\`
+$LOG_TAIL
+\`\`\`"
+fi
+
+# --- Step 7 (optional): Agent interpretation ---
+
+if [[ "$INTERPRET" == true && $EXIT_CODE -eq 0 ]]; then
+  echo "Running agent interpretation..."
+
+  ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:?ERROR: ANTHROPIC_API_KEY required for --interpret}"
+
+  # Assemble context
+  CONTEXT="CONTEXT:
+- Issue: $ISSUE_ID
+- Command: $CMD_STR
+- Exit code: $EXIT_CODE
+- Duration: $DURATION_FMT
+- Last 30 lines of output log:
+$(tail -30 "$LOG_FILE" 2>/dev/null || echo "(no log)")
+- SCP'd files:
+$(ls -lhS "$LOCAL_DEST/" 2>/dev/null | tail -n +2 || echo "(none)")"
+
+  # Include small text file contents
+  for f in "$LOCAL_DEST"/*.csv "$LOCAL_DEST"/*.json "$LOCAL_DEST"/*.txt "$LOCAL_DEST"/*.tsv; do
+    if [[ -f "$f" ]]; then
+      fsize=$(wc -c < "$f")
+      if (( fsize < 50000 )); then
+        CONTEXT="$CONTEXT
+
+- Contents of $(basename "$f"):
+$(cat "$f")"
+      fi
+    fi
+  done 2>/dev/null
+
+  # Include custom prompt if available
+  if [[ -f "$LOCAL_DEST/.lr-agent-prompt" ]]; then
+    CONTEXT="$CONTEXT
+
+- Custom instructions (.lr-agent-prompt):
+$(cat "$LOCAL_DEST/.lr-agent-prompt")"
+  fi
+
+  # Call Anthropic API
+  ESCAPED_CONTEXT=$(printf '%s' "$CONTEXT" | jq -Rs .)
+  RESPONSE=$(curl -s "$ANTHROPIC_API_URL/v1/messages" \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "content-type: application/json" \
+    -H "anthropic-version: 2023-06-01" \
+    -d "{
+      \"model\": \"claude-sonnet-4-20250514\",
+      \"max_tokens\": 1500,
+      \"system\": \"You are a research assistant interpreting neuroscience analysis results. Write a concise update for a Linear issue. Include: (1) what completed, (2) key quantitative results, (3) notable observations, (4) suggested next steps. Use markdown. Be specific, not vague.\",
+      \"messages\": [{\"role\": \"user\", \"content\": $ESCAPED_CONTEXT}]
+    }")
+
+  INTERPRETATION=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+
+  if [[ -n "$INTERPRETATION" ]]; then
+    "$LR_UPDATE" comment "$ISSUE_ID" "**Agent Interpretation**
+
+$INTERPRETATION"
+    "$LR_UPDATE" status "$ISSUE_ID" "Ready for Review"
+    echo "Interpretation posted to $ISSUE_ID"
+  else
+    echo "Warning: Could not generate interpretation" >&2
+    echo "$RESPONSE" | jq . >&2
+  fi
+fi
+
+echo "Done."

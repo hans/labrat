@@ -1,0 +1,37 @@
+configfile: "config.yaml"
+
+rule all:
+    input:
+        "results/metrics.json",
+        "results/predictions.csv",
+        "figures/confusion_matrix.png",
+        "figures/pca_scatter.png"
+
+rule load_data:
+    output:
+        "data/iris.csv"
+    script:
+        "scripts/load_data.py"
+
+rule train_model:
+    input:
+        "data/iris.csv"
+    output:
+        "results/metrics.json",
+        "results/predictions.csv"
+    params:
+        test_size=config["test_size"],
+        random_state=config["random_state"]
+    script:
+        "scripts/train_model.py"
+
+rule plot_results:
+    input:
+        predictions="results/predictions.csv",
+        metrics="results/metrics.json",
+        data="data/iris.csv"
+    output:
+        "figures/confusion_matrix.png",
+        "figures/pca_scatter.png"
+    script:
+        "scripts/plot_results.py"
