@@ -31,11 +31,11 @@ class TestLrIntegration:
     """End-to-end integration tests for lr."""
 
     def test_successful_pipeline_with_interpret(self, lr_env):
-        """Full happy path: lr runs pipeline, writes .lr-interpret, interpret script posts to Linear."""
+        """Full happy path: lr runs pipeline, interprets results, posts to Linear."""
         env = lr_env["env"]
         issue_id = create_test_issue(env)
 
-        # Step 1: Run lr with --interpret
+        # Run lr with --interpret (interpretation runs inline via host-mode fallback)
         result = subprocess.run(
             [
                 LR,
@@ -79,32 +79,7 @@ class TestLrIntegration:
         # Results copied to guest mount
         assert list(lr_env["guest_mount"].rglob("metrics.json")), "metrics.json not in guest mount"
 
-        # .lr-interpret request was written
-        interpret_files = list(lr_env["guest_mount"].rglob(".lr-interpret"))
-        assert interpret_files, (
-            ".lr-interpret not found in guest mount — interpretation handoff failed"
-        )
-        interpret_request = json.loads(interpret_files[0].read_text())
-        assert interpret_request["issue_id"] == issue_id
-        assert interpret_request["exit_code"] == 0
-
-        # Step 2: Run interpret script (simulates /interpret in Claude Code)
-        # Uses mock claude from tests/bin/ on PATH
-        interpret_result = subprocess.run(
-            [lr_env["interpret"], issue_id],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=30,
-        )
-
-        assert interpret_result.returncode == 0, (
-            f"interpret failed (exit {interpret_result.returncode}):\n"
-            f"STDOUT:\n{interpret_result.stdout}\n"
-            f"STDERR:\n{interpret_result.stderr}"
-        )
-
-        # .lr-interpret should be consumed
+        # .lr-interpret should be consumed (interpretation ran inline)
         interpret_files = list(lr_env["guest_mount"].rglob(".lr-interpret"))
         assert not interpret_files, ".lr-interpret still present after interpret ran"
 

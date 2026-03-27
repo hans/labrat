@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "claude-agent-sdk>=0.1.50",
+]
+
+[project.scripts]
+lr-interpret = "lrlib.interpret:main"
 
 [dependency-groups]
 dev = [

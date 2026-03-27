@@ -1,9 +1,66 @@
-#!/usr/bin/env bash
-# Mock claude CLI for integration tests.
-# Mimics `claude -p --system-prompt <prompt> <context>` by returning a canned interpretation.
+#!/usr/bin/env python3
+"""Mock claude CLI for integration tests.
 
-echo "**Analysis Summary**
+Implements the stream-json protocol expected by the Claude Agent SDK:
+1. Reads an initialize control_request from stdin
+2. Responds with a control_response on stdout
+3. Reads the user message from stdin
+4. Outputs a result message on stdout
+"""
 
-The Random Forest classifier achieved high accuracy on the Iris dataset. All three species were classified with >90% precision. Setosa was perfectly separated; minor confusion between versicolor and virginica.
+import json
+import sys
 
-**Next steps:** Try SVM or gradient boosting for comparison."
+
+INTERPRETATION = (
+    "**Analysis Summary**\n\n"
+    "The Random Forest classifier achieved high accuracy on the Iris dataset. "
+    "All three species were classified with >90% precision. "
+    "Setosa was perfectly separated; minor confusion between versicolor and virginica.\n\n"
+    "**Next steps:** Try SVM or gradient boosting for comparison."
+)
+
+
+def main():
+    # Read lines from stdin (the SDK sends JSON messages)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if msg.get("type") == "control_request":
+            # Respond to initialize (or any control request)
+            request_id = msg.get("request_id", "")
+            response = {
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request_id,
+                    "response": {},
+                },
+            }
+            print(json.dumps(response), flush=True)
+
+        elif msg.get("type") == "user":
+            # Got the user prompt — emit the result and exit
+            result = {
+                "type": "result",
+                "subtype": "success",
+                "duration_ms": 100,
+                "duration_api_ms": 50,
+                "is_error": False,
+                "num_turns": 1,
+                "session_id": "mock-session",
+                "result": INTERPRETATION,
+            }
+            print(json.dumps(result), flush=True)
+            break
+
+
+if __name__ == "__main__":
+    main()

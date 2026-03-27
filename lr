@@ -276,10 +276,12 @@ JSONEOF
 
   if [[ -n "$LR_GUEST_CONTAINER" ]]; then
     echo "Triggering interpretation in guest container..."
-    docker exec "$LR_GUEST_CONTAINER" interpret "$ISSUE_ID" || \
-      echo "Warning: docker exec failed. Run 'interpret $ISSUE_ID' manually in Claude Code." >&2
+    docker exec "$LR_GUEST_CONTAINER" python -m lrlib.interpret "$ISSUE_ID" || \
+      echo "Warning: docker exec failed. Run 'python -m lrlib.interpret $ISSUE_ID' manually." >&2
   else
-    echo "Run 'interpret $ISSUE_ID' in Claude Code to generate interpretation."
+    echo "Running host-mode interpretation..."
+    python -m lrlib.interpret --host "$ISSUE_ID" || \
+      echo "Warning: interpretation failed." >&2
   fi
 fi
 

@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -10,7 +11,7 @@ TESTS_DIR = Path(__file__).parent
 DOCKER_DIR = TESTS_DIR / "docker"
 MOCK_BIN_DIR = TESTS_DIR / "bin"
 PROJECT_ROOT = TESTS_DIR.parent
-INTERPRET = str(PROJECT_ROOT / "interpret")
+INTERPRET_CMD = [sys.executable, "-m", "lrlib.interpret", "--host"]
 
 
 @pytest.fixture(scope="session")
@@ -149,8 +150,11 @@ def lr_env(remote_container, tmp_path):
         f'LINEAR_TEAM_ID="{env["LINEAR_TEAM_ID"]}"\n'
     )
 
-    # Put mock claude on PATH for interpret script
+    # Point Agent SDK to mock claude and skip version check
     env["PATH"] = f"{MOCK_BIN_DIR}:{env.get('PATH', '')}"
+    env["CLAUDE_CLI_PATH"] = str(MOCK_BIN_DIR / "claude")
+    env["CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"] = "1"
+    env["PYTHONPATH"] = str(PROJECT_ROOT)
 
     env.update(
         {
@@ -168,5 +172,5 @@ def lr_env(remote_container, tmp_path):
         "results_dir": results_dir,
         "guest_mount": guest_mount,
         "remote_dir": rc["remote_dir"],
-        "interpret": INTERPRET,
+        "interpret_cmd": INTERPRET_CMD,
     }
